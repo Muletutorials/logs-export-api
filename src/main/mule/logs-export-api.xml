@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:s3="http://www.mulesoft.org/schema/mule/s3"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:cloudhub="http://www.mulesoft.org/schema/mule/cloudhub"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/cloudhub http://www.mulesoft.org/schema/mule/cloudhub/current/mule-cloudhub.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/s3 http://www.mulesoft.org/schema/mule/s3/current/mule-s3.xsd">
+	<flow name="export-cloudhub-logs-to-s3Flow">
+		<http:listener doc:name="Listener"
+			config-ref="HTTP_Listener_config" path="/logs" />
+		<ee:transform doc:name="Create payload">
+			<ee:message>
+				<ee:set-payload><![CDATA[output application/json ---
+{
+    "username": "anypoint-username",
+    "password": "anypoint-pwd"
+}]]></ee:set-payload>
+			</ee:message>
+			<ee:variables>
+				<ee:set-variable variableName="appName"><![CDATA[attributes.queryParams.appName]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<http:request method="POST" doc:name="Get Access Token"
+			config-ref="Anypoint_Request_Configuration" path="/accounts/login"
+			target="accessToken">
+		</http:request>
+		<flow-ref doc:name="get-env-id-subflow"
+			name="get-env-id-subflow" />
+		<flow-ref doc:name="get-deployment-id-subflow"
+			name="get-deployment-id-subflow" />
+		<http:request method="GET" doc:name="Get App Logs"
+			config-ref="Anypoint_Request_Configuration"
+			path='#["/cloudhub/api/v2/applications/" ++ vars.appName ++ "/deployments/" ++ vars.deploymentId ++ "/logs"]'
+			target="appLogs">
+			<http:headers><![CDATA[#[output application/java
+---
+{
+	"Authorization" : "Bearer " ++ vars.accessToken.access_token,
+	"X-ANYPNT-ENV-ID": vars.envId
+}]]]></http:headers>
+		</http:request>
+		<s3:list-buckets doc:name="List buckets"
+			config-ref="Amazon_S3_Configuration" region="US_WEST_2"
+			target="lbOutput" />
+		<set-variable value="mule-app-logs" doc:name="bucketName" variableName="bucketName"/>
+		<choice doc:name="Check if Bucket Exists?">
+			<when
+				expression='#[vars.lbOutput[?($.name == vars.bucketName)] == null]'>
+				<s3:create-bucket doc:name="Create bucket"
+					config-ref="Amazon_S3_Configuration" bucketName="mule-app-logs"
+					region="US_WEST_2" target="cbOutput" />
+			</when>
+			<otherwise>
+				<logger level="INFO" doc:name="INFO: Bucket Already Exists" message="Bucket Already Exists" />
+			</otherwise>
+		</choice>
+		<s3:create-object doc:name="Save logs to S3"
+			config-ref="Amazon_S3_Configuration"
+			bucketName="#[vars.bucketName]"
+			key='#[vars.appName ++ "-logs-" ++ now() ++ ".json"]'>
+			<s3:object-content><![CDATA[#[vars.appLogs]]]></s3:object-content>
+		</s3:create-object>
+		<logger level="INFO" doc:name="INFO: Export Finished" message="Export Finished"/>
+	</flow>
+	<sub-flow name="get-env-id-subflow">
+		<http:request method="GET" doc:name="Get Org ID"
+			config-ref="Anypoint_Request_Configuration" path="/accounts/api/me"
+			target="orgPayload">
+			<http:headers><![CDATA[#[output application/java
+---
+{
+	"Authorization" : "Bearer" ++ vars.accessToken.access_token
+}]]]></http:headers>
+		</http:request>
+		<http:request method="GET" doc:name="Get Env ID"
+			config-ref="Anypoint_Request_Configuration"
+			path='#["/accounts/api/organizations/" ++ vars.orgpayload.user.organizationId ++ "/environments"]'
+			target="envPayload">
+			<http:headers><![CDATA[#[output application/java
+---
+{
+	"Authorization" : "Bearer " ++ vars.accessToken.access_token
+}]]]></http:headers>
+			<http:query-params><![CDATA[#[{
+	name: "Sandbox"
+}]]]></http:query-params>
+		</http:request>
+		<set-variable
+			value='#[vars.envPayload.data[?($.name == "Sandbox")].id[0]]'
+			doc:name="envId" variableName="envId" />
+	</sub-flow>
+	<sub-flow name="get-deployment-id-subflow">
+		<http:request method="GET" doc:name="Get App Deployments"
+			config-ref="Anypoint_Request_Configuration"
+			path='#["/cloudhub/api/v2/applications/" ++ vars.appName ++ "/deployments"]'
+			target="deploymentsPayload">
+			<http:headers><![CDATA[#[output application/java
+---
+{
+	"Authorization" : "Bearer " ++ vars.accessToken.access_token,
+	"X-ANYPNT-ENV-ID": vars.envId
+}]]]></http:headers>
+			<http:query-params><![CDATA[#[output application/java
+---
+{
+	orderByDate : "DESC"
+}]]]></http:query-params>
+		</http:request>
+		<ee:transform doc:name="deploymentId">
+			<ee:message>
+			</ee:message>
+			<ee:variables>
+				<ee:set-variable variableName="deploymentId"><![CDATA[%dw 2.0
+output application/json
+import * from dw::core::Arrays
+var ids = vars.deploymentsPayload.data..deploymentId
+var status = vars.deploymentsPayload.data..status
+---
+ids[indexOf(status, "STARTED")]]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+	</sub-flow>
+</mule>
